@@ -27,7 +27,7 @@ Clarinet.test({
 });
 
 Clarinet.test({
-  name: "Can submit and retrieve weather data",
+  name: "Can submit and retrieve valid weather data",
   async fn(chain: Chain, accounts: Map<string, Account>) {
     const deployer = accounts.get("deployer")!;
     const provider = accounts.get("wallet_1")!;
@@ -64,5 +64,36 @@ Clarinet.test({
     );
     
     response.result.expectOk();
+  },
+});
+
+Clarinet.test({
+  name: "Rejects invalid weather data",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get("deployer")!;
+    const provider = accounts.get("wallet_1")!;
+    
+    let block = chain.mineBlock([
+      Tx.contractCall(
+        "weather-oracle",
+        "add-provider",
+        [types.principal(provider.address)],
+        deployer.address
+      ),
+      Tx.contractCall(
+        "weather-oracle",
+        "submit-weather-data",
+        [
+          types.ascii("New York"),
+          types.int(100),  // Invalid temperature
+          types.uint(150), // Invalid humidity
+          types.uint(5),
+          types.uint(45)
+        ],
+        provider.address
+      ),
+    ]);
+    
+    block.receipts[1].result.expectErr(103);
   },
 });
