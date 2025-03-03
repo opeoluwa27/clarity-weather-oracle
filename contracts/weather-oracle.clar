@@ -5,9 +5,31 @@
 (define-constant err-unauthorized (err u100))
 (define-constant err-invalid-data (err u101))
 (define-constant err-stale-data (err u102))
+(define-constant err-invalid-range (err u103))
+(define-constant err-contract-paused (err u104))
+(define-constant err-rate-limited (err u105))
+
+;; Data validation constants
+(define-constant min-temperature (- 50))  ;; -50°C
+(define-constant max-temperature 50)      ;; +50°C
+(define-constant max-humidity u100)       ;; 100%
+(define-constant max-uv-index u11)        ;; UV index scale
+(define-constant max-air-quality u500)    ;; AQI scale
+(define-constant submission-cooldown u6)  ;; Blocks between submissions
+
+;; Contract status
+(define-data-var contract-paused bool false)
 
 ;; Data Provider Management
-(define-map data-providers principal bool)
+(define-map data-providers 
+  principal 
+  {
+    authorized: bool,
+    reputation: uint,
+    last-update: uint,
+    submission-count: uint
+  }
+)
 
 ;; Weather Data Structure
 (define-map weather-data
@@ -22,16 +44,130 @@
   }
 )
 
+;; Events
+(define-data-var last-event-id uint u0)
+
+(define-map events
+  uint
+  {
+    event-type: (string-ascii 20),
+    provider: principal,
+    timestamp: uint
+  }
+)
+
+;; Event handling
+(define-private (emit-event (event-type (string-ascii 20)) (provider principal))
+  (let ((event-id (+ (var-get last-event-id) u1)))
+    (begin
+      (map-set events event-id
+        {
+          event-type: event-type,
+          provider: provider,
+          timestamp: block-height
+        }
+      )
+      (var-set last-event-id event-id)
+      event-id
+    )
+  )
+)
+
+;; Emergency pause
+(define-public (set-contract-pause (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (var-set contract-paused paused)
+    (emit-event (if paused "CONTRACT_PAUSED" "CONTRACT_RESUMED") tx-sender)
+    (ok true)
+  )
+)
+
 ;; Authorization check
 (define-private (is-authorized (provider principal))
-  (default-to false (map-get? data-providers provider))
+  (match (map-get? data-providers provider)
+    provider-data (get authorized provider-data)
+    false
+  )
+)
+
+;; Rate limiting check
+(define-private (check-rate-limit (provider principal))
+  (match (map-get? data-providers provider)
+    provider-data (> (- block-height (get last-update provider-data)) submission-cooldown)
+    false
+  )
+)
+
+;; Validate weather data
+(define-private (validate-weather-data 
+  (temperature int)
+  (humidity uint)
+  (uv-index uint)
+  (air-quality uint))
+  (and
+    (>= temperature min-temperature)
+    (<= temperature max-temperature)
+    (<= humidity max-humidity)
+    (<= uv-index max-uv-index)
+    (<= air-quality max-air-quality)
+  )
+)
+
+;; Update provider reputation
+(define-private (update-provider-reputation (provider principal) (success bool))
+  (match (map-get? data-providers provider)
+    provider-data
+    (let ((new-reputation (if success 
+      (+ (get reputation provider-data) u1)
+      (if (> (get reputation provider-data) u0)
+        (- (get reputation provider-data) u1)
+        u0))))
+      (map-set data-providers 
+        provider
+        (merge provider-data 
+          {
+            reputation: new-reputation,
+            last-update: block-height,
+            submission-count: (+ (get submission-count provider-data) u1)
+          }
+        )
+      ))
+    false
+  )
 )
 
 ;; Add data provider
 (define-public (add-provider (provider principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
-    (ok (map-set data-providers provider true))
+    (emit-event "PROVIDER_ADDED" provider)
+    (ok (map-set data-providers 
+      provider
+      {
+        authorized: true,
+        reputation: u0,
+        last-update: u0,
+        submission-count: u0
+      }
+    ))
+  )
+)
+
+;; Remove data provider
+(define-public (remove-provider (provider principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (emit-event "PROVIDER_REMOVED" provider)
+    (ok (map-delete data-providers provider))
+  )
+)
+
+;; Get provider status
+(define-read-only (get-provider-status (provider principal))
+  (match (map-get? data-providers provider)
+    data (ok data)
+    err-invalid-data
   )
 )
 
@@ -44,18 +180,25 @@
   (air-quality uint))
   (let
     ((provider tx-sender))
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
     (asserts! (is-authorized provider) err-unauthorized)
-    (ok (map-set weather-data
-      { location: location }
-      {
-        temperature: temperature,
-        humidity: humidity,
-        uv-index: uv-index,
-        air-quality: air-quality,
-        timestamp: block-height,
-        provider: provider
-      }
-    ))
+    (asserts! (check-rate-limit provider) err-rate-limited)
+    (asserts! (validate-weather-data temperature humidity uv-index air-quality) err-invalid-range)
+    (begin
+      (update-provider-reputation provider true)
+      (emit-event "DATA_SUBMITTED" provider)
+      (ok (map-set weather-data
+        { location: location }
+        {
+          temperature: temperature,
+          humidity: humidity,
+          uv-index: uv-index,
+          air-quality: air-quality,
+          timestamp: block-height,
+          provider: provider
+        }
+      ))
+    )
   )
 )
 
